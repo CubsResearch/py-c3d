@@ -1,0 +1,12 @@
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /opt/cubs/code/py-c3d
+file_exists_behavior: OVERWRITE
+permissions:
+  - object: /opt/cubs/code/py-c3d
+    pattern: "*"
+    owner: ec2-user
+    group: etl
+    mode: 775
