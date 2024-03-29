@@ -4,6 +4,7 @@ from __future__ import unicode_literals
 
 import sys
 import io
+import re
 import copy
 import numpy as np
 import struct
@@ -1865,7 +1866,7 @@ class Reader(Manager):
             warnings.warn('incomplete reading of data blocks. {} bytes remained after all datablocks were read!'.format(
                 self._handle.tell() - final_byte_index))
 
-    def read_all_frames(self, include_analog=True, include_rotations=False):
+    def read_all_frames(self, include_analog=True, include_rotations=False, transformation_matrix_format=False):
         '''
         Return all the data frames from our C3D file handle, instead of iterating through them.
         '''
@@ -1879,7 +1880,7 @@ class Reader(Manager):
 
         # TODO: handle ANALOG:BITS parameter here!
         if include_analog:
-            analog_out = np.zeros((self.last_frame() - self.first_frame() + 1, self.analog_used), float)
+            analog_out = np.zeros((self.last_frame - self.first_frame + 1, self.analog_used), float)
             analog_format = self.get('ANALOG:FORMAT')
             analog_unsigned = analog_format and analog_format.string_value.strip().upper() == 'UNSIGNED'
             analog_dtype = np.int16
@@ -1908,12 +1909,21 @@ class Reader(Manager):
                 gen_scale = param.float_value
 
         if include_rotations:
+            if not self.get('ROTATION:USED'):
+                warnings.warn('include_rotations option selected but no rotation data found in file!')
+                return [], [], [], []
+
             rotation_used = self.get('ROTATION:USED').uint16_value
-            positions = np.zeros((self.last_frame() - self.first_frame() + 1, rotation_used * 3), float)
-            rotations = np.zeros((self.last_frame() - self.first_frame() + 1, rotation_used * 9), float)
+            if transformation_matrix_format:
+                # return matrices in the same 4x4 transformation matrix format used in the csv files
+                positions = np.array([])
+                rotations = np.zeros((self.last_frame - self.first_frame + 1, rotation_used * 16), float)
+            else:
+                positions = np.zeros((self.last_frame - self.first_frame + 1, rotation_used * 3), float)
+                rotations = np.zeros((self.last_frame - self.first_frame + 1, rotation_used * 9), float)
 
         self._handle.seek((self.header.data_block - 1) * 512)
-        for frame_no in range(self.first_frame(), self.last_frame() + 1):
+        for frame_no in range(self.first_frame, self.last_frame + 1):
             if self.header.point_count > 0:
                 n = 4 * self.header.point_count
                 raw = np.fromstring(self._handle.read(n * point_bytes),
@@ -1947,16 +1957,33 @@ class Reader(Manager):
 
         # alas, rotations are tacked onto the end, so we have to loop through everything all over again.
         if include_rotations:
-            for frame_no in range(self.first_frame(), self.last_frame() + 1):
-                n = 17 * self.get('ROTATION:USED').uint16_value
-                raw = np.fromstring(self._handle.read(n * point_bytes),
-                                    dtype=point_dtype,
-                                    count=n)
+            n = 17 * self.get('ROTATION:USED').uint16_value
+            for frame_no in range(self.first_frame, self.last_frame + 1):
+                # first frame only: make sure you trim leading zeros
+                if frame_no == 1:
+                    first_bytes = self._handle.read(n * point_bytes)
+                    first_bytes = re.sub(b'^(\x00\x00\x00\x00)+',b'',first_bytes)
+                    # don't forget to fill in the ones you replaced!
+                    if len(first_bytes) < n * point_bytes:
+                        more_bytes = self._handle.read(n * point_bytes - len(first_bytes))
+                        first_bytes = first_bytes + more_bytes
+                    raw = np.fromstring(first_bytes,
+                                        dtype=point_dtype,
+                                        count=n)
+                else:
+                    raw = np.fromstring(self._handle.read(n * point_bytes),
+                                        dtype=point_dtype,
+                                        count=n)
 
-                rotations[frame_no - 1, :] = raw[np.isin(np.mod(np.arange(1,raw.size+1), 17), (1,2,3,5,6,7,9,10,11))] * point_scale
-                positions[frame_no - 1, :] = raw[np.isin(np.mod(np.arange(1,raw.size+1), 17), (13,14,15))] * point_scale
+                if transformation_matrix_format:
+                    # TODO: there's gotta be a more pythonic way to do this
+                    for ct, idx in enumerate([1,5,9,13,2,6,10,14,3,7,11,15,4,8,12,16]):
+                        rotations[frame_no - 1, ct:raw.size:16] = raw[np.isin(np.mod(np.arange(1,raw.size+1), 17), idx)] * point_scale
+                else:
+                    rotations[frame_no - 1, :] = raw[np.isin(np.mod(np.arange(1,raw.size+1), 17), (1,2,3,5,6,7,9,10,11))] * point_scale
+                    positions[frame_no - 1, :] = raw[np.isin(np.mod(np.arange(1,raw.size+1), 17), (13,14,15))] * point_scale
 
-        return list(range(self.first_frame(), self.last_frame() + 1)), \
+        return list(range(self.first_frame, self.last_frame + 1)), \
                positions if include_rotations else points, \
                rotations if include_rotations else [], \
                analog_out if include_analog else []
