@@ -1878,7 +1878,6 @@ class Reader(Manager):
         point_scale = [scale, 1][is_float]
         points = np.zeros((self.point_used, 5), float)
 
-        # TODO: handle ANALOG:BITS parameter here!
         if include_analog:
             analog_out = np.zeros((self.last_frame - self.first_frame + 1, self.analog_used), float)
             analog_format = self.get('ANALOG:FORMAT')
@@ -1976,7 +1975,8 @@ class Reader(Manager):
                                         count=n)
 
                 if transformation_matrix_format:
-                    # TODO: there's gotta be a more pythonic way to do this
+                    # This is a mess, I know, but the point is: the coordinates are presented in a (flattened) 4x4 rotation matrix, but we're expecting them
+                    # in this transposed order.  It would be cleaner -- but slower -- to convert to a 4x4 matrix, transpose, and then re-flatten.
                     for ct, idx in enumerate([1,5,9,13,2,6,10,14,3,7,11,15,4,8,12,16]):
                         rotations[frame_no - 1, ct:raw.size:16] = raw[np.isin(np.mod(np.arange(1,raw.size+1), 17), idx)] * point_scale
                 else:
