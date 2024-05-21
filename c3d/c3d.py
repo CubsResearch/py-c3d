@@ -4,6 +4,7 @@ from __future__ import unicode_literals
 
 import sys
 import io
+import re
 import copy
 import numpy as np
 import struct
@@ -1864,6 +1865,128 @@ class Reader(Manager):
         if self._handle.tell() - final_byte_index >= 512:
             warnings.warn('incomplete reading of data blocks. {} bytes remained after all datablocks were read!'.format(
                 self._handle.tell() - final_byte_index))
+
+    def read_all_frames(self, include_analog=True, include_rotations=False, transformation_matrix_format=False):
+        '''
+        Return all the data frames from our C3D file handle, instead of iterating through them.
+        '''
+        scale = abs(self.point_scale)
+        is_float = self.point_scale < 0
+
+        point_bytes = [2, 4][is_float]
+        point_dtype = [np.int16, np.float32][is_float]
+        point_scale = [scale, 1][is_float]
+        points = np.zeros((self.point_used, 5), float)
+
+        if include_analog:
+            analog_out = np.zeros((self.last_frame - self.first_frame + 1, self.analog_used), float)
+            analog_format = self.get('ANALOG:FORMAT')
+            analog_unsigned = analog_format and analog_format.string_value.strip().upper() == 'UNSIGNED'
+            analog_dtype = np.int16
+            analog_bytes = 2
+            if is_float:
+                analog_dtype = np.float32
+                analog_bytes = 4
+            elif analog_unsigned:
+                analog_dtype = np.uint16
+                analog_bytes = 2
+            analog = np.array([], float)
+
+            offsets = np.zeros((self.analog_used, 1), int)
+            param = self.get('ANALOG:OFFSET')
+            if param is not None:
+                offsets = param.int16_array[:self.analog_used, None]
+
+            scales = np.ones((self.analog_used, 1), float)
+            param = self.get('ANALOG:SCALE')
+            if param is not None:
+                scales = param.float_array[:self.analog_used, None]
+
+            gen_scale = 1.
+            param = self.get('ANALOG:GEN_SCALE')
+            if param is not None:
+                gen_scale = param.float_value
+
+        if include_rotations:
+            if not self.get('ROTATION:USED'):
+                warnings.warn('include_rotations option selected but no rotation data found in file!')
+                return [], [], [], []
+
+            rotation_used = self.get('ROTATION:USED').uint16_value
+            if transformation_matrix_format:
+                # return matrices in the same 4x4 transformation matrix format used in the csv files
+                positions = np.array([])
+                rotations = np.zeros((self.last_frame - self.first_frame + 1, rotation_used * 16), float)
+            else:
+                positions = np.zeros((self.last_frame - self.first_frame + 1, rotation_used * 3), float)
+                rotations = np.zeros((self.last_frame - self.first_frame + 1, rotation_used * 9), float)
+
+        self._handle.seek((self.header.data_block - 1) * 512)
+        for frame_no in range(self.first_frame, self.last_frame + 1):
+            if self.header.point_count > 0:
+                n = 4 * self.header.point_count
+                raw = np.fromstring(self._handle.read(n * point_bytes),
+                                    dtype=point_dtype,
+                                    count=n).reshape((self.point_used, 4))
+
+                points[:, :3] = raw[:, :3] * point_scale
+
+                valid = raw[:, 3] > -1
+                points[~valid, 3:5] = -1
+                error_estimate = raw[valid, 3].astype(np.uint16)
+
+                # fourth value is floating-point (scaled) error estimate
+                points[valid, 3] = (error_estimate & 0xff).astype(float) * scale
+
+                # fifth value is number of bits set in camera-observation byte
+                points[valid, 4] = sum((error_estimate & (1 << k)) >> k for k in range(8, 17))
+
+            if self.header.analog_count > 0:
+                n = self.header.analog_count
+                raw = np.fromstring(self._handle.read(n * analog_bytes),
+                                    dtype=analog_dtype,
+                                    count=n).reshape((self.analog_used, -1))
+                analog = (raw.astype(float) - offsets) * scales * gen_scale
+                # keeping with KinaTrax's convention, we only keep the first row
+                # and throw out the other three to drop from 1200 Hz to 300 Hz
+                if np.shape(analog)[-1] > 0:
+                    analog_out[frame_no - 1, :] = analog[:, 0]
+                else:
+                    analog_out[frame_no - 1, :] = analog
+
+        # alas, rotations are tacked onto the end, so we have to loop through everything all over again.
+        if include_rotations:
+            n = 17 * self.get('ROTATION:USED').uint16_value
+            for frame_no in range(self.first_frame, self.last_frame + 1):
+                # first frame only: make sure you trim leading zeros
+                if frame_no == 1:
+                    first_bytes = self._handle.read(n * point_bytes)
+                    first_bytes = re.sub(b'^(\x00\x00\x00\x00)+',b'',first_bytes)
+                    # don't forget to fill in the ones you replaced!
+                    if len(first_bytes) < n * point_bytes:
+                        more_bytes = self._handle.read(n * point_bytes - len(first_bytes))
+                        first_bytes = first_bytes + more_bytes
+                    raw = np.fromstring(first_bytes,
+                                        dtype=point_dtype,
+                                        count=n)
+                else:
+                    raw = np.fromstring(self._handle.read(n * point_bytes),
+                                        dtype=point_dtype,
+                                        count=n)
+
+                if transformation_matrix_format:
+                    # This is a mess, I know, but the point is: the coordinates are presented in a (flattened) 4x4 rotation matrix, but we're expecting them
+                    # in this transposed order.  It would be cleaner -- but slower -- to convert to a 4x4 matrix, transpose, and then re-flatten.
+                    for ct, idx in enumerate([1,5,9,13,2,6,10,14,3,7,11,15,4,8,12,16]):
+                        rotations[frame_no - 1, ct:raw.size:16] = raw[np.isin(np.mod(np.arange(1,raw.size+1), 17), idx)] * point_scale
+                else:
+                    rotations[frame_no - 1, :] = raw[np.isin(np.mod(np.arange(1,raw.size+1), 17), (1,2,3,5,6,7,9,10,11))] * point_scale
+                    positions[frame_no - 1, :] = raw[np.isin(np.mod(np.arange(1,raw.size+1), 17), (13,14,15))] * point_scale
+
+        return list(range(self.first_frame, self.last_frame + 1)), \
+               positions if include_rotations else points, \
+               rotations if include_rotations else [], \
+               analog_out if include_analog else []
 
     @property
     def proc_type(self):
