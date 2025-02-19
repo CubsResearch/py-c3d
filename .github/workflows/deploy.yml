@@ -5,7 +5,7 @@ on:
       - master
 jobs:
   deploy:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
     - name: codedeploy
       run: aws deploy create-deployment --application-name py-c3d --deployment-group-name=ETL --github-location repository=CubsResearch/py-c3d,commitId=${GITHUB_SHA}
